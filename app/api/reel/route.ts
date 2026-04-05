@@ -2,143 +2,64 @@ import { NextRequest, NextResponse } from "next/server";
  
 export const runtime = "edge";
  
-const IG_HEADERS = {
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  Accept: "*/*",
-  "Accept-Language": "en-US,en;q=0.9",
-  "Accept-Encoding": "gzip, deflate, br",
-  Referer: "https://www.instagram.com/",
-  Origin: "https://www.instagram.com",
-  "X-IG-App-ID": "936619743392459",
-};
+/**
+ * GET /api/reel?url=<instagram_reel_url>
+ *
+ * Uses RapidAPI "Social Media Video Downloader" — free 500 req/month.
+ * Sign up: https://rapidapi.com/ugoBOT/api/social-media-video-downloader
+ * Set RAPIDAPI_KEY in Vercel → Settings → Environment Variables.
+ */
  
-function extractShortcode(url: string): string | null {
-  const m = url.match(/(?:reel|p|tv)\/([A-Za-z0-9_-]+)/);
-  return m ? m[1] : null;
-}
+const RAPIDAPI_KEY  = process.env.RAPIDAPI_KEY ?? "";
+const RAPIDAPI_HOST = "social-media-video-downloader.p.rapidapi.com";
  
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
-  const postUrl = searchParams.get("url");
+  const postUrl = searchParams.get("url")?.trim();
  
-  if (!postUrl) {
-    return NextResponse.json({ error: "No URL provided" }, { status: 400 });
-  }
- 
-  const shortcode = extractShortcode(postUrl);
-  if (!shortcode) {
-    return NextResponse.json({ error: "Invalid Instagram URL" }, { status: 400 });
-  }
+  if (!postUrl)       return NextResponse.json({ error: "No URL provided" }, { status: 400 });
+  if (!RAPIDAPI_KEY)  return NextResponse.json({ error: "RAPIDAPI_KEY not configured on server." }, { status: 500 });
  
   try {
-    // Method 1: Instagram oEmbed (no auth needed, public posts only)
-    const oembedUrl = `https://www.instagram.com/api/v1/oembed/?url=${encodeURIComponent(postUrl)}&hidecaption=false&maxwidth=500&cb=1`;
+    const apiUrl = `https://${RAPIDAPI_HOST}/smvd/get/all?url=${encodeURIComponent(postUrl)}`;
  
-    // Method 2: Instagram media info via GraphQL
-    const graphqlUrl = `https://www.instagram.com/graphql/query/?query_hash=2b0673e0dc4580674a88d426fe00ea90&variables=${encodeURIComponent(
-      JSON.stringify({ shortcode })
-    )}`;
+    const res = await fetch(apiUrl, {
+      headers: {
+        "x-rapidapi-key":  RAPIDAPI_KEY,
+        "x-rapidapi-host": RAPIDAPI_HOST,
+      },
+    });
  
-    // Method 3: Direct media endpoint
-    const mediaUrl = `https://www.instagram.com/p/${shortcode}/?__a=1&__d=dis`;
- 
-    // Try Method 3 first (most reliable)
-    let videoUrl: string | null = null;
-    let thumbnail: string | null = null;
- 
-    try {
-      const res = await fetch(mediaUrl, {
-        headers: {
-          ...IG_HEADERS,
-          "X-Requested-With": "XMLHttpRequest",
-        },
-      });
- 
-      if (res.ok) {
-        const text = await res.text();
-        // parse the JSON safely
-        const data = JSON.parse(text);
-        const item =
-          data?.items?.[0] ||
-          data?.graphql?.shortcode_media ||
-          data?.data?.shortcode_media;
- 
-        if (item) {
-          videoUrl =
-            item?.video_versions?.[0]?.url ||
-            item?.video_url ||
-            item?.clips_metadata?.original_sound_info?.progressive_download_url;
-          thumbnail =
-            item?.image_versions2?.candidates?.[0]?.url ||
-            item?.display_url;
-        }
-      }
-    } catch (_) {}
- 
-    // Try Method 2 (GraphQL)
-    if (!videoUrl) {
-      try {
-        const res = await fetch(graphqlUrl, { headers: IG_HEADERS });
-        if (res.ok) {
-          const data = await res.json();
-          const media = data?.data?.shortcode_media;
-          if (media?.is_video) {
-            videoUrl = media.video_url;
-            thumbnail = media.display_url;
-          }
-        }
-      } catch (_) {}
+    if (!res.ok) {
+      const txt = await res.text();
+      return NextResponse.json({ error: `RapidAPI ${res.status}: ${txt.slice(0, 200)}` }, { status: res.status });
     }
  
-    // Try Method 4: scrape the page HTML for video URL
-    if (!videoUrl) {
-      try {
-        const pageRes = await fetch(`https://www.instagram.com/reel/${shortcode}/`, {
-          headers: {
-            ...IG_HEADERS,
-            Accept: "text/html,application/xhtml+xml",
-          },
-        });
+    const data = await res.json();
  
-        if (pageRes.ok) {
-          const html = await pageRes.text();
- 
-          // Look for video URL in page source
-          const videoMatch =
-            html.match(/"video_url":"([^"]+)"/) ||
-            html.match(/"contentUrl":"([^"]+)"/) ||
-            html.match(/property="og:video"\s+content="([^"]+)"/);
- 
-          if (videoMatch) {
-            videoUrl = videoMatch[1].replace(/\\u0026/g, "&").replace(/\\/g, "");
-          }
- 
-          // thumbnail
-          const thumbMatch = html.match(/property="og:image"\s+content="([^"]+)"/);
-          if (thumbMatch) {
-            thumbnail = thumbMatch[1];
-          }
-        }
-      } catch (_) {}
-    }
- 
-    if (!videoUrl) {
+    // shape: { success, title, links: [{ quality, link }] }
+    if (!data?.success || !data?.links?.length) {
       return NextResponse.json(
-        {
-          error:
-            "Could not extract video URL. The reel may be private or Instagram blocked the request.",
-        },
+        { error: "No media found. Reel may be private or URL is wrong." },
         { status: 422 }
       );
     }
  
+    const links: { quality: string; link: string }[] = data.links;
+ 
+    // prefer audio-only link; fallback to first available
+    const audioLink = links.find(l =>
+      ["audio","mp3","m4a"].some(k => l.quality?.toLowerCase().includes(k))
+    );
+    const best = audioLink ?? links[0];
+ 
     return NextResponse.json({
-      success: true,
-      shortcode,
-      videoUrl,
-      thumbnail,
+      success:  true,
+      videoUrl: best.link,
+      quality:  best.quality,
+      title:    data.title ?? "",
     });
+ 
   } catch (err: any) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
